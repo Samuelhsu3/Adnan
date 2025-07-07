@@ -1,0 +1,72 @@
+library(tidyverse)
+library(readxl)
+library(writexl)
+
+
+
+data <- "delta_scores.xlsx"
+output1 <- "fa_change_wide_data.xlsx"
+output2 <- "all_vars_wide_data.xlsx"
+
+long_data <- read_excel(data)
+
+long_data <- long_data %>%
+  rename_with(~ str_replace_all(., " ", "_")) %>%
+  rename_with(~ str_replace_all(., "/", "_")) %>%
+  mutate(Window = str_replace_all(Window, "-", "_"))
+
+print(head(long_data))
+
+
+roi_cols <- c(
+  "genu_of_CC",
+  "body_of_CC",
+  "splenium_of_CC",
+  "column_body_of_fornix",
+  "anterior_limb_of_interior_capsule_R",
+  "anterior_limb_of_interior_capsule_L",
+  "posterior_limb_of_interior_capsule_R",
+  "posterior_limb_of_interior_capsule_L",
+  "Fornix_crux_R",
+  "fornix_crux_L",
+  "uncinate_fasciculus_R",
+  "uncinate_fasciculus_L",
+  "UF_(collapsed)",
+  "Fornix_(collapsed)"
+)
+
+wide_data_fa_change <- long_data %>%
+  dplyr::select(SubID, Window, all_of(roi_cols)) %>%
+  pivot_wider(
+    names_from = Window,
+    values_from = all_of(roi_cols),
+    names_sep = "_"
+  )
+
+print("Pivoted FA Change data:")
+print(head(wide_data_fa_change))
+
+static_cols <- c("SubID", "Initials", "DOB", "Sex", "domhand", "yoe", "age", "DOI")
+dynamic_cols <- setdiff(names(long_data), static_cols)
+dynamic_cols <- setdiff(dynamic_cols, "Window")
+
+existing_dynamic_cols <- intersect(dynamic_cols, names(long_data))
+
+wide_data_all_relevant_vars <- long_data %>%
+  dplyr::select(all_of(c(static_cols, "Window", existing_dynamic_cols))) %>%
+  pivot_wider(
+    id_cols = all_of(static_cols),
+    names_from = Window,
+    values_from = all_of(existing_dynamic_cols),
+    names_sep = "_"
+  )
+
+print("Pivoted All Variables data:")
+print(head(wide_data_all_relevant_vars))
+
+
+write_xlsx(wide_data_fa_change, output1)
+print(paste("\nFA Change Wide Data saved to:", output1))
+
+write_xlsx(wide_data_all_relevant_vars, output2)
+print(paste("All Relevant Variables Wide Data saved to:", output2))

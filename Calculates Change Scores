@@ -1,0 +1,109 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+
+tryCatch({
+  file_path <- "Replication of Adnan's Paper (7-7).xlsx"
+  sheet_name <- "DATA"
+  long_data <- read_excel(file_path, 
+                          sheet = sheet_name,
+                          na = c("", "NA", "null", "none", "#N/A"))
+}, error = function(e) {
+  stop("file name.")
+})
+
+data_prepared <- long_data %>%
+  mutate(MRI_timepoint_numeric = as.numeric(gsub("[^0-9.-]", "", MRI_timepoint))) %>%
+  filter(!is.na(MRI_timepoint_numeric) & MRI_timepoint_numeric != "")
+
+static_cols <- c("SubID", "Initials", "TestOrd", "DOB", "Sex", "domhand", "yoe", 
+                 "age", "DOI", "Testsession", "Date_of_testing", "MRI_timepoint", 
+                 "Days_from_timepoint", "Exclucode", "Exclusion_comments", 
+                 "Days_post_injury", "ACLOS", "LowestGCSscore", "GCSscene", 
+                 "GCSEmerg", "LPTA")
+
+all_cols <- names(data_prepared)
+score_cols_pot <- setdiff(all_cols, c(static_cols, "MRI_timepoint_numeric"))
+
+score_cols <- c()
+for (col_name in score_cols_pot) {
+ 
+  data_prepared[[col_name]] <- suppressWarnings(as.numeric(as.character(data_prepared[[col_name]])))
+  if (!all(is.na(data_prepared[[col_name]]))) {
+    score_cols <- c(score_cols, col_name)
+  }
+}
+
+cols_for_pivot <- c("SubID", "MRI_timepoint_numeric", score_cols)
+
+wide_data <- data_prepared[, cols_for_pivot] %>%
+  pivot_wider(
+    names_from = MRI_timepoint_numeric,
+    values_from = score_cols,
+    names_sep = "_T"
+  )
+
+windows <- list(
+  c(start = 2, end = 5, label = "2-5"),
+  c(start = 5, end = 12, label = "5-12"),
+  c(start = 12, end = 24, label = "12-24")
+)
+
+all_changes_list <- list()
+
+for (win in windows) {
+  start_tp <- win[["start"]]
+  end_tp <- win[["end"]]
+  window_label <- win[["label"]]
+  
+  window_results <- data.frame(SubID = wide_data$SubID, Window = window_label)
+  
+  for (score in score_cols) {
+    start_col_name <- paste0(score, "_T", start_tp)
+    end_col_name <- paste0(score, "_T", end_tp)
+
+    if (start_col_name %in% names(wide_data) && end_col_name %in% names(wide_data)) {
+
+      start_values <- as.numeric(as.character(wide_data[[start_col_name]]))
+      end_values <- as.numeric(as.character(wide_data[[end_col_name]]))
+      
+      change_values <- end_values - start_values
+      window_results[[score]] <- change_values
+    } else {
+      window_results[[score]] <- NA_real_
+    }
+  }
+
+  all_changes_list[[window_label]] <- window_results
+}
+
+change_scores_long <- bind_rows(all_changes_list)
+
+
+static_info <- data_prepared %>%
+  group_by(SubID) %>%
+  arrange(MRI_timepoint_numeric) %>%
+  slice(1) %>%
+  ungroup() %>%
+ 
+  select_(.dots = static_cols)
+
+final_data <- right_join(static_info, change_scores_long, by = "SubID")
+
+final_col_order <- c("SubID", setdiff(static_cols, "SubID"), "Window", score_cols)
+final_col_order <- final_col_order[final_col_order %in% names(final_data)]
+
+
+final_data <- final_data[, final_col_order] %>%
+
+  filter_at(vars(one_of(score_cols)), any_vars(!is.na(.))) %>%
+ 
+  arrange(SubID, factor(Window, levels = c("2-5", "5-12", "12-24")))
+
+
+output_path <- "delta_scores.xlsx"
+write_xlsx(final_data, path = output_path)
+
+print(paste("Saved as:", output_path))
+print(head(final_data))

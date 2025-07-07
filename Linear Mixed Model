@@ -1,0 +1,146 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+library(tibble)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(ggeffects)
+
+
+file_path <- "Replication of Adnan's Paper (7-7).xlsx"
+sheet_name <- "DATA"
+roi_cols <- c(
+  "genu of CC", "body of CC", "splenium of CC", "column/body of fornix",
+  "anterior limb of interior capsule R", "anterior limb of interior capsule L",
+  "posterior limb of interior capsule R", "posterior limb of interior capsule L",
+  "Fornix crux R", "fornix crux L", "uncinate fasciculus R", "uncinate fasciculus L"
+)
+
+covariate_cols <- c("age", "yoe", "ACLOS", "LPTA")
+
+data <- read_excel(file_path, sheet = sheet_name, na = c("NA", "-", "none", "")) %>%
+  mutate(across(all_of(c(roi_cols, "Days_post_injury", covariate_cols)), as.numeric)) %>%
+  mutate(SubID = as.factor(SubID)) %>%
+  filter(!is.na(Days_post_injury) & !is.na(SubID)) %>%
+  arrange(SubID, Days_post_injury) %>%
+  group_by(SubID) %>%
+  mutate(across(all_of(covariate_cols), ~ first(na.omit(.)), .names = "{.col}_baseline")) %>%
+  ungroup()
+
+run_lmer_for_roi <- function(dataset, roi_name) {
+  
+  model_data <- dataset %>%
+    dplyr::select(SubID, Days_post_injury, all_of(roi_name), ends_with("_baseline")) %>%
+    dplyr::rename(current_roi_val = !!sym(roi_name)) %>%
+    drop_na(current_roi_val)
+  
+  if (n_distinct(model_data$SubID) < 5 || nrow(model_data) < (n_distinct(model_data$SubID) + 10)) {
+    return(NULL)
+  }
+  
+  base_formula <- "current_roi_val ~ Days_post_injury"
+  
+
+  available_covariates <- character()
+  for (cov in paste0(covariate_cols, "_baseline")) {
+    if (cov %in% names(model_data) && n_distinct(model_data[[cov]], na.rm = TRUE) > 1) {
+      available_covariates <- c(available_covariates, cov)
+    }
+  }
+  
+  if (length(available_covariates) > 0) {
+    base_formula <- paste(base_formula, "+", paste(available_covariates, collapse = " + "))
+  }
+  
+  model_formula_str <- paste(base_formula, "+ (1 | SubID)")
+  model_formula <- as.formula(model_formula_str)
+  
+  lmer_model <- tryCatch(
+    lmer(model_formula, data = model_data),
+    error = function(e) NULL
+  )
+  
+  if (is.null(lmer_model)) return(NULL)
+
+  coeffs_summary <- as.data.frame(summary(lmer_model)$coefficients) %>%
+    rownames_to_column(var = "Term")
+  
+  anova_summary <- as.data.frame(anova(lmer_model)) %>%
+    rownames_to_column(var = "Term")
+  
+  results <- inner_join(coeffs_summary, anova_summary, by = "Term") %>%
+    filter(Term == "Days_post_injury") %>%
+    dplyr::select(
+      Term,
+      Estimate_Coeff = Estimate,
+      Std_Error_Coeff = `Std. Error`,
+      df_Coeff = df,
+      t_value_Coeff = `t value`,
+      Pr_t_Coeff = `Pr(>|t|)`,
+      F_value_Anova = `F value`,
+      NumDF_Anova = NumDF,
+      DenDF_Anova = DenDF,
+      Pr_F_Anova = `Pr(>F)`
+    ) %>%
+    mutate(ROI = roi_name, ModelFormula = model_formula_str, .before = 1)
+  
+  return(list(results = results, model_object = lmer_model))
+}
+
+
+all_model_outputs <- lapply(roi_cols, function(roi) {
+  if (roi %in% names(data)) run_lmer_for_roi(data, roi)
+})
+
+compiled_results <- bind_rows(lapply(all_model_outputs, `[[`, "results"))
+
+if (nrow(compiled_results) > 0) {
+  compiled_results <- compiled_results %>%
+    mutate(Pr_F_Anova_Holm = p.adjust(Pr_F_Anova, method = "holm", n = length(roi_cols)))
+  
+  write_xlsx(
+    list("LMM_Results" = compiled_results),
+    path = "lmm_analysis_results.xlsx"
+  )
+}
+
+
+significant_rois <- compiled_results %>%
+  filter(Pr_F_Anova_Holm < 0.05)
+
+if (nrow(significant_rois) > 0) {
+  
+  plot_list <- lapply(significant_rois$ROI, function(roi_name) {
+    
+    model_info <- all_model_outputs[[which(roi_cols == roi_name)]]
+    model <- model_info$model_object
+    if (is.null(model)) return(NULL)
+    
+    p_vals <- significant_rois %>% filter(ROI == roi_name)
+    pred_eff <- ggpredict(model, terms = "Days_post_injury [all]")
+    
+    ggplot(model@frame, aes(x = Days_post_injury, y = current_roi_val)) +
+      geom_line(aes(group = SubID), alpha = 0.2, color = "grey50") +
+      geom_point(aes(group = SubID), alpha = 0.4, color = "grey50") +
+      geom_ribbon(data = pred_eff, aes(x = x, ymin = conf.low, ymax = conf.high), fill = "dodgerblue", alpha = 0.2, inherit.aes = FALSE) +
+      geom_line(data = pred_eff, aes(x = x, y = predicted), color = "dodgerblue4", linewidth = 1.2) +
+      labs(
+        title = paste("FA Trajectory for:", roi_name),
+        subtitle = paste0(
+          "Holm p = ", format.pval(p_vals$Pr_F_Anova_Holm, digits = 2, eps = 0.001),
+          " (Raw p = ", format.pval(p_vals$Pr_F_Anova, digits = 2, eps = 0.001), ")"
+        ),
+        x = "Days Post-Injury",
+        y = "Fractional Anisotropy (FA)"
+      ) +
+      theme_minimal(base_size = 14)
+  })
+  
+  pdf("lmm_significant_plots.pdf", width = 10, height = 7)
+  for (p in plot_list) {
+    if (!is.null(p)) print(p)
+  }
+  dev.off()
+}

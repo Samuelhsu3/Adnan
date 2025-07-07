@@ -1,0 +1,219 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+
+
+data2 <- read_excel("Replication of Adnan's Paper (Results Sum+Lit Review).xlsx",
+                    sheet = "FA values + NeuroPsych",
+                    na = c("NA", "-", "none", ""))
+
+roi_cols <- c("genu of CC", "body of CC", "splenium of CC", "column/body of fornix",
+              "anterior limb of interior capsule R", "anterior limb of interior capsule L",
+              "posterior limb of interior capsule R", "posterior limb of interior capsule L",
+              "Fornix crux R", "fornix crux L", "uncinate fasciculus R", "uncinate fasciculus L")
+
+initial_test_score_cols <- c("ravlttotz", "ravltldz", "rvdlttotz", "rvdltld", "lm1ss", "lm2ss")
+initial_covariate_cols <- c("age", "yoe") 
+initial_demographic_cols <- c(initial_covariate_cols, "sex", "Days_post_injury") 
+
+existing_test_score_cols <- intersect(initial_test_score_cols, names(data2))
+existing_covariate_cols <- intersect(initial_covariate_cols, names(data2)) 
+existing_demographic_cols <- intersect(initial_demographic_cols, names(data2))
+
+if (length(roi_cols) > 0 && all(roi_cols %in% names(data2))) { data2[roi_cols] <- lapply(data2[roi_cols], as.character) }
+if (length(existing_test_score_cols) > 0) { data2[existing_test_score_cols] <- lapply(data2[existing_test_score_cols], as.character) }
+if (length(existing_demographic_cols) > 0) { for(col in existing_demographic_cols){ if(col %in% names(data2)) data2[[col]] <- as.character(data2[[col]]) }}
+
+is_valid_numeric_entry <- function(x_val, col_name_for_check) { 
+  if (col_name_for_check == "sex") { 
+    is_placeholder <- tolower(as.character(x_val)) %in% c("na", "-", "none", "") 
+    return(!is_placeholder && !is.na(x_val)) 
+  }
+  is_placeholder <- tolower(as.character(x_val)) %in% c("-", "none", "") 
+  return(!is_placeholder & (!is.na(suppressWarnings(as.numeric(x_val))) | is.na(x_val)) )
+}
+
+check_subject <- function(sub_df, sub_id, current_roi_cols, 
+                          current_test_score_cols, current_demo_cols, 
+                          check_cognitive_and_demos_for_na = TRUE) { 
+  timepoints <- c("5 months", "12 months", "24 months") 
+  selected_rows <- list()
+  sub_df$MRI_timepoint <- trimws(sub_df$MRI_timepoint)
+  for (tp_label in timepoints) { 
+    rows <- sub_df %>% dplyr::filter(MRI_timepoint == tp_label)
+    if (nrow(rows) == 0) return(NULL) 
+    if (length(current_roi_cols) > 0 && current_roi_cols[1] %in% names(rows)) {
+      rows <- rows %>% dplyr::filter(sapply(.[[current_roi_cols[1]]], is_valid_numeric_entry, col_name_for_check = current_roi_cols[1]))
+    } else if (length(current_roi_cols) > 0) { return(NULL) }
+    if (nrow(rows) == 0) return(NULL)
+    actual_roi_cols_in_rows <- intersect(current_roi_cols, names(rows))
+    if(length(current_roi_cols) > 0 && length(actual_roi_cols_in_rows) != length(current_roi_cols)) return(NULL)
+    if (length(actual_roi_cols_in_rows) > 0) {
+      roi_data_for_tp <- rows %>% dplyr::select(all_of(actual_roi_cols_in_rows))
+      all_rois_are_potentially_numeric <- apply(roi_data_for_tp, 1, function(row_data){all(sapply(row_data, function(val) !is.na(suppressWarnings(as.numeric(as.character(val)))) || is.na(val)))})
+      rows <- rows[all_rois_are_potentially_numeric, ]
+      if (nrow(rows) == 0) return(NULL)
+      numeric_roi_data <- rows %>% dplyr::select(all_of(actual_roi_cols_in_rows)) %>% dplyr::mutate(across(everything(), ~as.numeric(as.character(.))))
+      if (nrow(unique(numeric_roi_data)) > 1) return(NULL)
+    }
+    candidate_row <- rows[1, ] 
+    if (length(actual_roi_cols_in_rows) > 0) {
+      roi_values_for_na_check <- candidate_row %>% dplyr::select(all_of(actual_roi_cols_in_rows)) %>% dplyr::mutate(across(everything(), as.numeric))
+      if(any(is.na(roi_values_for_na_check))) return(NULL)
+    }
+
+    if ("Days_post_injury" %in% names(candidate_row)) {
+      if(is.na(as.numeric(candidate_row[["Days_post_injury"]]))) {
+        if(check_cognitive_and_demos_for_na) return(NULL) # Stricter for sub3ST
+      }
+    } else { 
+      if(check_cognitive_and_demos_for_na) return(NULL) # Stricter for sub3ST
+    } 
+    
+    if (check_cognitive_and_demos_for_na) { 
+      actual_test_cols_in_cand <- intersect(current_test_score_cols, names(candidate_row))
+      if (length(current_test_score_cols) > 0) { 
+        if (length(actual_test_cols_in_cand) != length(current_test_score_cols)) return(NULL) 
+        test_scores_values <- candidate_row %>% dplyr::select(all_of(actual_test_cols_in_cand)) %>% dplyr::mutate(across(everything(), as.numeric))
+        if (any(is.na(test_scores_values))) return(NULL)
+      }
+      actual_demo_cols_in_cand <- intersect(current_demo_cols, names(candidate_row)) # current_demo_cols here will include age, yoe, sex
+      if (length(current_demo_cols) > 0) { 
+        if (length(actual_demo_cols_in_cand) != length(current_demo_cols)) return(NULL) 
+        for(col in actual_demo_cols_in_cand){
+          if(col %in% c("age", "yoe")){ demo_val <- candidate_row[[col]]; if(is.na(as.numeric(demo_val))) return(NULL) }
+          if(col == "sex"){ sex_val <- as.character(candidate_row[[col]]); if(is.na(sex_val) || sex_val == "" || tolower(sex_val) == "na") return(NULL) }
+        }
+      }
+    }
+    selected_rows[[tp_label]] <- candidate_row 
+  }
+  return(bind_rows(selected_rows))
+}
+
+cat("Filtering for sub3S (3 valid FA scans)...\n")
+subject_groups_for_sub3S <- data2 %>% dplyr::group_by(SubID) %>% dplyr::group_split()
+subject_results_sub3S <- lapply(subject_groups_for_sub3S, function(sub_df) {
+  if (nrow(sub_df) > 0 && "SubID" %in% names(sub_df)) {
+    check_subject(sub_df, unique(sub_df$SubID)[1], 
+                  current_roi_cols = roi_cols, 
+                  current_test_score_cols = c(), # Not checking test scores for NA for sub3S
+                  current_demo_cols = c("Days_post_injury"),   # Only ensuring Days_post_injury is valid for sub3S
+                  check_cognitive_and_demos_for_na = FALSE)
+  } else { NULL }
+})
+sub3S <- bind_rows(subject_results_sub3S[!sapply(subject_results_sub3S, is.null)])
+
+if (nrow(sub3S) > 0) { 
+  if(all(roi_cols %in% names(sub3S))) { 
+    sub3S[roi_cols] <- lapply(sub3S[roi_cols], function(x) as.numeric(as.character(x)))
+  }
+  # Convert other columns that might have been carried over if they exist
+  cols_to_convert_sub3S_tests <- intersect(existing_test_score_cols, names(sub3S))
+  cols_to_convert_sub3S_covs <- intersect(existing_covariate_cols, names(sub3S)) # age, yoe
+  cols_to_convert_sub3S_demos <- intersect(c("Days_post_injury", "sex"), names(sub3S))
+  
+  if (length(cols_to_convert_sub3S_tests) > 0) { sub3S[cols_to_convert_sub3S_tests] <- lapply(sub3S[cols_to_convert_sub3S_tests], function(x) as.numeric(as.character(x))) }
+  if (length(cols_to_convert_sub3S_covs) > 0) { sub3S[cols_to_convert_sub3S_covs] <- lapply(sub3S[cols_to_convert_sub3S_covs], function(x) as.numeric(as.character(x))) }
+  if ("Days_post_injury" %in% cols_to_convert_sub3S_demos) { sub3S[["Days_post_injury"]] <- as.numeric(as.character(sub3S[["Days_post_injury"]]))}
+  if ("SubID" %in% names(sub3S)) { sub3S$SubID <- factor(sub3S$SubID) }
+  
+} else { 
+  cat("No subjects found for sub3S. FA change analysis will be skipped.\n")
+  sub3S <- data.frame() 
+}
+
+fa_analysis_sheets <- list() 
+if (nrow(sub3S) > 0 && all(roi_cols %in% names(sub3S))) {
+  cat("Performing FA change analysis on sub3S (t-tests)...\n")
+  mean_fa_sub3S <- sub3S %>% dplyr::group_by(MRI_timepoint) %>% dplyr::summarise(across(all_of(roi_cols), mean, na.rm = TRUE), .groups = "drop") %>% dplyr::arrange(match(MRI_timepoint, c("5 months", "12 months", "24 months")))
+  wide_data_fa_ttest_sub3S <- sub3S %>% dplyr::select(SubID, MRI_timepoint, all_of(roi_cols)) %>% tidyr::pivot_wider(names_from = MRI_timepoint, values_from = all_of(roi_cols), names_sep = "_")
+  
+  comparisons<-list(`5_vs_12`=c("5 months","12 months"),`12_vs_24`=c("12 months","24 months"),`5_vs_24`=c("5 months","24 months"))
+  cohen_d_paired<-function(x,y){diff_scores<-x-y;if(sd(diff_scores,na.rm=TRUE)==0){if(all(diff_scores==0,na.rm=TRUE))return(0)else return(NA)};d<-mean(diff_scores,na.rm=TRUE)/sd(diff_scores,na.rm=TRUE);return(d)}
+  pval_matrix<-list();effect_matrix<-list();tval_matrix<-list()
+  for(comp in names(comparisons)){
+    tp1<-comparisons[[comp]][1];tp2<-comparisons[[comp]][2];pvals<-c();effects<-c();tvals<-c()
+    for(region in roi_cols){
+      col_tp1<-paste0(region,"_",tp1);col_tp2<-paste0(region,"_",tp2)
+      if(!col_tp1%in%names(wide_data_fa_ttest_sub3S)||!col_tp2%in%names(wide_data_fa_ttest_sub3S)){pvals<-c(pvals,NA);effects<-c(effects,NA);tvals<-c(tvals,NA);next}
+      v1<-wide_data_fa_ttest_sub3S[[col_tp1]];v2<-wide_data_fa_ttest_sub3S[[col_tp2]]
+      df_ttest<-data.frame(v1=v1,v2=v2)%>%drop_na()
+      if(nrow(df_ttest)<3){pvals<-c(pvals,NA);effects<-c(effects,NA);tvals<-c(tvals,NA);next}
+      m1<-mean(df_ttest$v1,na.rm=TRUE);m2<-mean(df_ttest$v2,na.rm=TRUE)
+      alt<-if(m1>m2)"greater"else if(m1<m2)"less"else"two.sided"
+      test<-t.test(df_ttest$v1,df_ttest$v2,paired=TRUE,alternative=alt)
+      pvals<-c(pvals,test$p.value);effects<-c(effects,cohen_d_paired(df_ttest$v1,df_ttest$v2));t_str<-sprintf("t=%.3f (df=%d)",test$statistic,round(test$parameter));tvals<-c(tvals,t_str)
+    }
+    pval_matrix[[comp]]<-pvals;effect_matrix[[comp]]<-effects;tval_matrix[[comp]]<-tvals
+  }
+  pval_df_sub3S<-data.frame(Comparison=names(pval_matrix),do.call(rbind,pval_matrix));if(ncol(pval_df_sub3S)>1)colnames(pval_df_sub3S)[-1]<-roi_cols
+  effect_df_sub3S<-data.frame(Comparison=paste0(names(effect_matrix),"_effect_size"),do.call(rbind,effect_matrix));if(ncol(effect_df_sub3S)>1)colnames(effect_df_sub3S)[-1]<-roi_cols
+  tval_df_sub3S<-data.frame(Comparison=paste0(names(tval_matrix),"_t(df)"),do.call(rbind,tval_matrix));if(ncol(tval_df_sub3S)>1)colnames(tval_df_sub3S)[-1]<-roi_cols
+  pval_df_sub3S[]<-lapply(pval_df_sub3S,as.character);effect_df_sub3S[]<-lapply(effect_df_sub3S,as.character);tval_df_sub3S[]<-lapply(tval_df_sub3S,as.character)
+  t_test_output_sub3S<-bind_rows(pval_df_sub3S,effect_df_sub3S,tval_df_sub3S)
+  holm_corrected_values_list<-list();for(i in 1:nrow(pval_df_sub3S)){p_values_for_row<-suppressWarnings(as.numeric(pval_df_sub3S[i,-1]));if(all(is.na(p_values_for_row))){holm_corrected_values_list[[i]]<-rep(NA,length(p_values_for_row))}else{holm_corrected_values_list[[i]]<-p.adjust(p_values_for_row,method="holm")}}
+  holm_corrected_values_sub3S<-do.call(rbind,holm_corrected_values_list);holm_corrected_df_sub3S<-data.frame(Comparison=pval_df_sub3S$Comparison,holm_corrected_values_sub3S);if(ncol(holm_corrected_df_sub3S)>1)colnames(holm_corrected_df_sub3S)[-1]<-roi_cols    
+  
+  fa_analysis_sheets[['Mean FA (sub3S)']] <- mean_fa_sub3S
+  fa_analysis_sheets[['t tests (sub3S)']] <- t_test_output_sub3S
+  fa_analysis_sheets[['Holm corrected (sub3S)']] <- holm_corrected_df_sub3S
+} 
+
+subject_groups_for_sub3ST_filter_check <- data2 %>% dplyr::group_by(SubID) %>% dplyr::group_split()
+subject_results_sub3ST_filter_check <- lapply(subject_groups_for_sub3ST_filter_check, function(sub_df) {
+  if (nrow(sub_df) > 0 && "SubID" %in% names(sub_df)) {
+    check_subject(sub_df, unique(sub_df$SubID)[1], 
+                  current_roi_cols = roi_cols, 
+                  current_test_score_cols = existing_test_score_cols, 
+                  current_demo_cols = existing_demographic_cols, # Includes age, yoe, sex, Days_post_injury
+                  check_cognitive_and_demos_for_na = TRUE)
+  } else { NULL }
+})
+sub3ST_for_filtering <- bind_rows(subject_results_sub3ST_filter_check[!sapply(subject_results_sub3ST_filter_check, is.null)])
+
+cat("\n\n--- Summary of Participant Filtering ---\n")
+num_sub3S <- if(exists("sub3S") && is.data.frame(sub3S) && nrow(sub3S) > 0) dplyr::n_distinct(sub3S$SubID) else 0 
+num_sub3ST_for_filtering <- if(exists("sub3ST_for_filtering") && is.data.frame(sub3ST_for_filtering) && nrow(sub3ST_for_filtering) > 0) dplyr::n_distinct(sub3ST_for_filtering$SubID) else 0 
+
+cat(paste0("Number of unique participants in sub3S (3 valid FA scans & Days_post_injury): ", num_sub3S, "\n"))
+cat(paste0("Number of unique participants who would qualify for sub3ST criteria: ", num_sub3ST_for_filtering, "\n"))
+
+all_initial_subids <- if("SubID" %in% names(data2)) unique(data2$SubID) else c()
+sub3ST_present_subids <- if(num_sub3ST_for_filtering > 0 && "SubID" %in% names(sub3ST_for_filtering)) unique(sub3ST_for_filtering$SubID) else c()
+filtered_out_ids <- setdiff(all_initial_subids, sub3ST_present_subids)
+
+filtered_out_df <- data.frame(Message="No subjects filtered out from sub3ST criteria or an issue occurred.") 
+if(length(filtered_out_ids) > 0){
+  filtered_out_df <- data.frame(SubID = filtered_out_ids)
+  cat(paste0(length(filtered_out_ids), " subjects from original data were filtered out from meeting sub3ST criteria. IDs listed in FA_analysis_final.xlsx.\n"))
+} else {
+  cat("No subjects were filtered out from meeting sub3ST criteria (or no subjects in original data).\n")
+}
+
+if (!exists("fa_analysis_sheets") || !is.list(fa_analysis_sheets)) { 
+  fa_analysis_sheets <- list() 
+}
+fa_analysis_sheets[['Filtered_Out_from_sub3ST_Criteria']] <- filtered_out_df
+
+if(length(fa_analysis_sheets) > 0 ) {
+ 
+  has_data_to_write <- any(sapply(fa_analysis_sheets, function(x) {
+    if(is.data.frame(x)) {
+      return(nrow(x) > 0 && ! (nrow(x) == 1 && "Message" %in% names(x) && grepl("No subjects filtered out", x$Message[1], ignore.case = TRUE) ) )
+    }
+    return(FALSE)
+  })) || ("Filtered_Out_from_sub3ST_Criteria" %in% names(fa_analysis_sheets) && nrow(fa_analysis_sheets[['Filtered_Out_from_sub3ST_Criteria']]) > 0 && "SubID" %in% names(fa_analysis_sheets[['Filtered_Out_from_sub3ST_Criteria']]))
+  
+  
+  if (has_data_to_write) {
+    write_xlsx(fa_analysis_sheets, path="FA_T-test comparison.xlsx")
+    cat("FA_T-test comparison.xlsx has been updated/created.\n")
+  } else {
+    cat("FA_analysis.xlsx was not written as no FA analysis results and no actual filtered subjects to report.\n")
+  }
+} else {
+  cat("FA_analysis.xlsx was not written as no data sheets were generated.\n")
+}
+

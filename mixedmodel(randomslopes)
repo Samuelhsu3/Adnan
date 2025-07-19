@@ -1,0 +1,84 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+library(tibble)
+library(lme4)
+library(lmerTest)
+library(ggeffects)
+
+file_path <- "Replication of Adnan's Paper (7-19).xlsx"
+sheet_name <- "DATA"
+roi_cols <- c(
+  "uncinate fasciculus R", "uncinate fasciculus L", "fornix crux L"
+)
+
+covariate_cols <- c("age", "yoe", "ACLOS", "LowestGCSscore")
+
+data <- read_excel(file_path, sheet = sheet_name, na = c("NA", "-", "none", "")) %>%
+  mutate(across(all_of(c(roi_cols, "Days_post_injury", covariate_cols)), as.numeric)) %>%
+  mutate(SubID = as.factor(SubID)) %>%
+  filter(!is.na(Days_post_injury) & !is.na(SubID)) %>%
+  arrange(SubID, Days_post_injury) %>%
+  group_by(SubID) %>%
+  mutate(across(all_of(covariate_cols), ~ first(na.omit(.)), .names = "{.col}_baseline")) %>%
+  ungroup()
+
+baseline_covariate_names <- paste0(covariate_cols, "_baseline")
+vars_to_standardize <- c("Days_post_injury", baseline_covariate_names, roi_cols)
+existing_vars_to_standardize <- intersect(vars_to_standardize, names(data))
+
+data_standardized <- data %>%
+  mutate(across(all_of(existing_vars_to_standardize), ~ as.numeric(scale(.))))
+
+run_lmer_interaction_model <- function(dataset, roi_name) {
+  model_data <- dataset %>%
+    dplyr::select(SubID, Days_post_injury, all_of(roi_name), all_of(baseline_covariate_names)) %>%
+    dplyr::rename(current_roi_val = !!sym(roi_name)) %>%
+    drop_na(current_roi_val)
+  
+  if (n_distinct(model_data$SubID) < 5 || nrow(model_data) < (n_distinct(model_data$SubID) + 15)) {
+    return(NULL)
+  }
+  
+  other_covariates <- paste(setdiff(baseline_covariate_names, "LowestGCSscore_baseline"), collapse = " + ")
+  model_formula_str <- paste("current_roi_val ~ Days_post_injury * LowestGCSscore_baseline +", other_covariates, "+ (Days_post_injury | SubID)")
+  model_formula <- as.formula(model_formula_str)
+  
+  control <- lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
+  lmer_model <- tryCatch(lmer(model_formula, data = model_data, control = control), error = function(e) NULL)
+  
+  if (is.null(lmer_model)) return(NULL)
+  
+  fixed_effects <- as.data.frame(summary(lmer_model)$coefficients) %>%
+    rownames_to_column(var = "Term") %>%
+    mutate(ROI = roi_name, .before = 1)
+  
+  random_effects <- as.data.frame(VarCorr(lmer_model)) %>%
+    select(grp, var1, var2, vcov, sdcor) %>%
+    mutate(ROI = roi_name, .before = 1)
+  
+  return(list(fixed_effects = fixed_effects, random_effects = random_effects, model_object = lmer_model))
+}
+
+all_model_outputs <- lapply(roi_cols, function(roi) {
+  if (roi %in% names(data_standardized)) {
+    run_lmer_interaction_model(data_standardized, roi)
+  }
+})
+all_model_outputs <- all_model_outputs[!sapply(all_model_outputs, is.null)]
+
+if (length(all_model_outputs) > 0) {
+  fixed_effects_final <- bind_rows(lapply(all_model_outputs, `[[`, "fixed_effects"))
+  random_effects_final <- bind_rows(lapply(all_model_outputs, `[[`, "random_effects"))
+  
+  output_sheets <- list(
+    "Random_Effects_Summary" = random_effects_final,
+    "Fixed_Effects" = fixed_effects_final
+  )
+  
+  write_xlsx(
+    output_sheets,
+    path = "lmm_random_slope_with_gcs_interaction.xlsx"
+  )
+}

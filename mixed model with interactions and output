@@ -1,0 +1,119 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+library(tibble)
+library(lme4)
+library(lmerTest)
+
+file_path <- "Replication of Adnan's Paper (7-17).xlsx"
+sheet_name <- "DATA"
+roi_cols <- c(
+  "genu of CC", "body of CC", "splenium of CC", "column/body of fornix",
+  "anterior limb of interior capsule R", "anterior limb of interior capsule L",
+  "posterior limb of interior capsule R", "posterior limb of interior capsule L",
+  "Fornix crux R", "fornix crux L", "uncinate fasciculus R", "uncinate fasciculus L"
+)
+
+covariate_cols <- c("age", "yoe", "ACLOS", "LowestGCSscore")
+
+data <- read_excel(file_path, sheet = sheet_name, na = c("NA", "-", "none", "")) %>%
+  mutate(across(all_of(c(roi_cols, "Days_post_injury", covariate_cols)), as.numeric)) %>%
+  mutate(SubID = as.factor(SubID)) %>%
+  filter(!is.na(Days_post_injury) & !is.na(SubID)) %>%
+  arrange(SubID, Days_post_injury) %>%
+  group_by(SubID) %>%
+  mutate(across(all_of(covariate_cols), ~ first(na.omit(.)), .names = "{.col}_baseline")) %>%
+  ungroup()
+
+baseline_covariate_names <- paste0(covariate_cols, "_baseline")
+vars_to_standardize <- c("Days_post_injury", baseline_covariate_names, roi_cols)
+existing_vars_to_standardize <- intersect(vars_to_standardize, names(data))
+
+data_standardized <- data %>%
+  mutate(across(all_of(existing_vars_to_standardize), ~ as.numeric(scale(.))))
+
+run_full_lmer_model <- function(dataset, roi_name) {
+  model_data <- dataset %>%
+    dplyr::select(SubID, Days_post_injury, all_of(roi_name), all_of(baseline_covariate_names)) %>%
+    dplyr::rename(current_roi_val = !!sym(roi_name)) %>%
+    drop_na()
+
+  if (n_distinct(model_data$SubID) < 5 || nrow(model_data) < (n_distinct(model_data$SubID) + 20)) {
+    return(NULL)
+  }
+
+  interactions_to_include <- paste(baseline_covariate_names, collapse = " + Days_post_injury * ")
+  model_formula_str <- paste0("current_roi_val ~ Days_post_injury * ", interactions_to_include, " + (1 | SubID)")
+  model_formula <- as.formula(model_formula_str)
+
+  lmer_model <- tryCatch(lmer(model_formula, data = model_data), error = function(e) {
+    return(NULL)
+  })
+  
+  if (is.null(lmer_model)) return(NULL)
+
+  coeffs_summary <- as.data.frame(summary(lmer_model)$coefficients) %>%
+    rownames_to_column(var = "Term") %>%
+    mutate(ROI = roi_name, .before = 1) 
+  
+  return(coeffs_summary)
+}
+
+all_results_raw <- bind_rows(lapply(roi_cols, function(roi) {
+  if (roi %in% names(data_standardized)) {
+    run_full_lmer_model(data_standardized, roi)
+  }
+}))
+
+if (nrow(all_results_raw) > 0) {
+  results_corrected <- all_results_raw %>%
+    group_by(Term) %>%
+    mutate(Pr_t_Holm = p.adjust(`Pr(>|t|)`, method = "holm")) %>%
+    ungroup() %>%
+    dplyr::select(
+        ROI,
+        Term, 
+        Estimate, 
+        `Std. Error`,
+        df, 
+        `t value`, 
+        `Pr(>|t|)`,
+        Pr_t_Holm
+    )
+
+  sheet_name_map <- c(
+    "genu of CC" = "Genu_CC",
+    "body of CC" = "Body_CC",
+    "splenium of CC" = "Splenium_CC",
+    "column/body of fornix" = "Fornix_ColBody",
+    "anterior limb of interior capsule R" = "ALIC_R",
+    "anterior limb of interior capsule L" = "ALIC_L",
+    "posterior limb of interior capsule R" = "PLIC_R",
+    "posterior limb of interior capsule L" = "PLIC_L",
+    "Fornix crux R" = "FornixCrux_R",
+    "fornix crux L" = "FornixCrux_L",
+    "uncinate fasciculus R" = "UF_R",
+    "uncinate fasciculus L" = "UF_L"
+  )
+
+  output_sheets <- list()
+  
+  for (roi in roi_cols) {
+    sheet_data <- results_corrected %>%
+      filter(ROI == roi)
+      
+    sheet_name <- sheet_name_map[roi]
+    
+    if (nrow(sheet_data) > 0) {
+      output_sheets[[sheet_name]] <- sheet_data
+    }
+  }
+
+  if (length(output_sheets) > 0) {
+    write_xlsx(
+      output_sheets,
+      path = "FINALFINALMIXEDMODEL.xlsx"
+    )
+  }
+}

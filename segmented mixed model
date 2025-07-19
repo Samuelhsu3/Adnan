@@ -1,0 +1,142 @@
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(writexl)
+library(tibble)
+library(lme4)
+library(lmerTest)
+library(ggplot2)
+library(ggeffects)
+
+file_path <- "Replication of Adnan's Paper (7-19).xlsx"
+sheet_name <- "DATA"
+roi_cols <- c(
+  "fornix crux L"
+)
+
+covariate_cols <- c("age", "yoe", "ACLOS", "LowestGCSscore")
+
+MONTH_IN_DAYS <- 30.4375
+START_MONTH <- 5
+KNOT_MONTH <- 12
+END_MONTH <- 24
+
+START_DAY <- START_MONTH * MONTH_IN_DAYS
+KNOT_DAY <- KNOT_MONTH * MONTH_IN_DAYS
+END_DAY <- END_MONTH * MONTH_IN_DAYS
+
+data <- read_excel(file_path, sheet = sheet_name, na = c("NA", "-", "none", "")) %>%
+  mutate(across(all_of(c(roi_cols, "Days_post_injury", covariate_cols)), as.numeric)) %>%
+  mutate(SubID = as.factor(SubID)) %>%
+  filter(!is.na(Days_post_injury) & !is.na(SubID)) %>%
+  arrange(SubID, Days_post_injury) %>%
+  group_by(SubID) %>%
+  mutate(across(all_of(covariate_cols), ~ first(na.omit(.)), .names = "{.col}_baseline")) %>%
+  ungroup()
+
+data_piecewise <- data %>%
+  filter(Days_post_injury >= START_DAY & Days_post_injury <= END_DAY) %>%
+  mutate(
+    time1 = Days_post_injury - START_DAY,
+    time2 = pmax(0, Days_post_injury - KNOT_DAY)
+  )
+
+baseline_covariate_names <- paste0(covariate_cols, "_baseline")
+vars_to_standardize <- c("time1", "time2", baseline_covariate_names, roi_cols)
+existing_vars_to_standardize <- intersect(vars_to_standardize, names(data_piecewise))
+
+data_standardized <- data_piecewise %>%
+  mutate(across(all_of(existing_vars_to_standardize), ~ as.numeric(scale(.))))
+
+run_lmer_piecewise <- function(dataset, roi_name) {
+  model_data <- dataset %>%
+    dplyr::select(SubID, time1, time2, all_of(roi_name), all_of(baseline_covariate_names)) %>%
+    dplyr::rename(current_roi_val = !!sym(roi_name)) %>%
+    drop_na(current_roi_val)
+  
+  if (n_distinct(model_data$SubID) < 5 || nrow(model_data) < (n_distinct(model_data$SubID) + 15)) {
+    return(NULL)
+  }
+  
+  main_effects <- paste(baseline_covariate_names, collapse = " + ")
+  model_formula_str <- paste("current_roi_val ~ time1 + time2 +", main_effects, "+ (1 | SubID)")
+  model_formula <- as.formula(model_formula_str)
+  
+  lmer_model <- tryCatch(lmer(model_formula, data = model_data), error = function(e) NULL)
+  if (is.null(lmer_model)) return(NULL)
+  
+  coeffs_summary <- as.data.frame(summary(lmer_model)$coefficients) %>%
+    rownames_to_column(var = "Term")
+  
+  results <- coeffs_summary %>%
+    filter(Term %in% c("time1", "time2")) %>%
+    dplyr::select(
+      Term, Standardized_Beta = Estimate, Std_Error_Coeff = `Std. Error`,
+      df_Coeff = df, t_value_Coeff = `t value`, Pr_t = `Pr(>|t|)`
+    ) %>%
+    mutate(ROI = roi_name, ModelFormula = model_formula_str, .before = 1)
+  
+  return(list(results = results, model_object = lmer_model))
+}
+
+all_model_outputs <- lapply(roi_cols, function(roi) {
+  if (roi %in% names(data_standardized)) {
+    run_lmer_piecewise(data_standardized, roi)
+  }
+})
+
+all_model_outputs <- all_model_outputs[!sapply(all_model_outputs, is.null)]
+
+compiled_results <- bind_rows(lapply(all_model_outputs, `[[`, "results"))
+
+if (nrow(compiled_results) > 0) {
+  final_results <- compiled_results %>%
+    group_by(Term) %>%
+    mutate(Pr_t_Holm = p.adjust(Pr_t, method = "holm", n = length(roi_cols))) %>%
+    ungroup() %>%
+    arrange(ROI, Term)
+  
+  write_xlsx(
+    list("Piecewise_LMM_Results" = final_results),
+    path = "lmm_piecewise_resultsnew.xlsx"
+  )
+}
+
+if (length(all_model_outputs) > 0) {
+  plot_list <- list()
+  for (i in 1:length(all_model_outputs)) {
+    model_info <- all_model_outputs[[i]]
+    model <- model_info$model_object
+    roi_name <- model_info$results$ROI[1]
+    
+    pred_eff <- ggpredict(model, terms = c("time1", "time2"))
+    
+    plot_data <- model@frame
+    plot_data$Days_post_injury <- data_piecewise$Days_post_injury[as.numeric(rownames(model@frame))]
+    
+    p_val_time1 <- final_results %>% filter(ROI == roi_name, Term == "time1") %>% pull(Pr_t)
+    p_val_time2 <- final_results %>% filter(ROI == roi_name, Term == "time2") %>% pull(Pr_t)
+    
+    p <- ggplot() +
+      geom_vline(xintercept = KNOT_DAY, linetype = "dashed", color = "firebrick") +
+      geom_line(data = pred_eff, aes(x = data_piecewise$Days_post_injury[as.numeric(rownames(pred_eff))], y = predicted), color = "royalblue", linewidth = 1.2) +
+      geom_ribbon(data = pred_eff, aes(x = data_piecewise$Days_post_injury[as.numeric(rownames(pred_eff))], ymin = conf.low, ymax = conf.high), 
+                  fill = "royalblue", alpha = 0.2, inherit.aes = FALSE) +
+      labs(
+        title = paste("Piecewise FA Trajectory for:", roi_name),
+        subtitle = paste0("p(5-12 mo slope) = ", format.pval(p_val_time1, digits=2), 
+                          ", p(change in slope) = ", format.pval(p_val_time2, digits=2)),
+        x = "Days Post-Injury",
+        y = "Standardized FA Value"
+      ) +
+      theme_minimal(base_size = 14)
+    
+    plot_list[[roi_name]] <- p
+  }
+  
+  pdf("lmm_piecewise_plotsnew.pdf", width = 10, height = 7)
+  for (p in plot_list) {
+    print(p)
+  }
+  dev.off()
+}
